@@ -27,12 +27,16 @@ The outputs in this folder are the **single source of truth** for all other team
 | `address`       | string    | Informal address / location description.                  |
 | `lat`           | float     | Latitude (WGS 84, EPSG:4326).                             |
 | `lng`           | float     | Longitude (WGS 84, EPSG:4326).                            |
-| `price`         | category  | Price level (e.g. `cheap`, `moderate`, `expensive`).      |
+| `price`         | category  | Cleaned price level (`cheap`, `moderate`, `expensive`, `very expensive`). |
 | `likes`         | float     | Number of likes on Foursquare.                            |
 | `photos`        | int       | Number of photos.                                         |
 | `tips`          | int       | Number of text tips / comments (count only).              |
 | `rating`        | float     | Average user rating (0–10 scale).                         |
 | `ratingSignals` | float     | Number of users who rated the place (often missing).      |
+| `postcode`      | string    | 5-digit postal code extracted from `address` when present. |
+| `price_code`    | int       | Encoded price level (`cheap=0`, `moderate=1`, `expensive=2`, `very expensive=3`). |
+
+> `postcode` and `price_code` are **engineered columns** created by the Data Engineer for easier analysis.
 
 ---
 
@@ -46,7 +50,7 @@ The outputs in this folder are the **single source of truth** for all other team
 
 The difference of 6 rows is mainly due to **duplicate removal** and basic quality checks.
 
-### Missing Values After Cleaning (`riyadh_restaurants_clean.csv`)
+### Missing Values After Cleaning (original source columns)
 
 | Column          | Missing |
 |-----------------|---------|
@@ -66,6 +70,9 @@ Notes:
 
 - All **critical analysis columns** (`price`, `rating`, `lat`, `lng`, `likes`) are complete.
 - `ratingSignals` is missing for many restaurants (as in the original source) and is left as `NaN` on purpose.
+- **Engineered columns:**
+  - `price_code` has no missing values (derived directly from cleaned `price`).
+  - `postcode` can be `NaN` when no 5-digit pattern is found in `address`.
 
 ---
 
@@ -91,8 +98,6 @@ data_engineering/
     01_explore_raw.ipynb
     02_clean_data.ipynb
     03_export_geojson.ipynb
-  docs/
-    Data_Engineering_and_Preprocessing_Report(1).pdf
 ```
 
 ---
@@ -110,6 +115,17 @@ The notebooks are designed to run with:
 - **CLI tools**:
   - `gdal` / `ogr2ogr` (installed at system level, used for clipping)
 
+Example setup (conda):
+
+```bash
+conda create -n riyadh-restaurants python=3.10
+conda activate riyadh-restaurants
+
+pip install pandas numpy geopandas shapely
+# GDAL is installed via system package manager (e.g. apt) or conda-forge
+```
+
+---
 
 ## 5. Data Engineering Pipeline
 
@@ -163,13 +179,14 @@ df_clean = df_clean.drop_duplicates(subset=["name", "lat", "lng"])
 - First removes exact full-row duplicates.
 - Then removes likely duplicates of the **same physical restaurant** (same `name`, `lat`, `lng`).
 
-#### 5.2.4 Price Cleaning & Imputation
+#### 5.2.4 Price Cleaning
 
 ```python
 df_clean["price"] = df_clean["price"].str.strip().str.lower()
 df_clean["price"] = df_clean["price"].replace("nan", np.nan)
 
 price_mode = df["price"].mode()[0]
+price_mode = price_mode.strip().lower()
 df_clean["price"] = df_clean["price"].fillna(price_mode)
 ```
 
@@ -184,7 +201,27 @@ Resulting `price` categories include:
 - `expensive`
 - `very expensive`
 
-#### 5.2.5 Rating Imputation
+#### 5.2.5 Price Encoding (`price_code`)
+
+```python
+price_map = {
+    "cheap": 0,
+    "moderate": 1,
+    "expensive": 2,
+    "very expensive": 3,
+}
+
+df_clean["price_code"] = df_clean["price"].map(price_map)
+```
+
+- Adds a numeric column `price_code` for modeling / correlations:
+  - `cheap = 0`
+  - `moderate = 1`
+  - `expensive = 2`
+  - `very expensive = 3`
+- `price` remains as human-readable labels.
+
+#### 5.2.6 Rating Imputation
 
 ```python
 rating_mean = df_clean["rating"].mean()
@@ -194,7 +231,7 @@ df_clean["rating"] = df_clean["rating"].fillna(rating_mean)
 - `rating` is already numeric.
 - Missing ratings are filled with the **overall mean rating**.
 
-#### 5.2.6 Likes & Other Fields
+#### 5.2.7 Likes & Other Fields
 
 ```python
 df_clean["likes"] = df_clean["likes"].fillna(0)
@@ -207,7 +244,7 @@ Other columns:
 - `photos`, `tips` → already complete, left unchanged.
 - `ratingSignals` → many missing values, intentionally left as `NaN`.
 
-#### 5.2.7 Text Normalization
+#### 5.2.8 Text Normalization
 
 ```python
 for col in ["name", "categories", "address"]:
@@ -218,7 +255,29 @@ for col in ["name", "categories", "address"]:
 - Removes leading and trailing whitespace from `name`, `categories`, and `address`.
 - **Preserves** original capitalization and internal punctuation (`o'reilly`, `mcdonald's`, etc.).
 
-#### 5.2.8 Save Cleaned CSV
+#### 5.2.9 Postcode Extraction
+
+```python
+import re
+import numpy as np
+
+def extract_postcode(addr):
+    if pd.isna(addr):
+        return np.nan
+    addr = str(addr)
+    matches = re.findall(r"(\d{5})", addr)
+    if not matches:
+        return np.nan
+    return matches[-1]
+
+df_clean["postcode"] = df_clean["address"].apply(extract_postcode)
+```
+
+- Searches each `address` for **5-digit numbers**.
+- If multiple 5-digit blocks exist, uses the **last one** (usually the postcode at the end).
+- If no 5-digit pattern is found, `postcode` is set to `NaN`.
+
+#### 5.2.10 Save Cleaned CSV
 
 ```python
 df_clean.to_csv("../data/clean/riyadh_restaurants_clean.csv", index=False)
@@ -227,7 +286,7 @@ df_clean.to_csv("../data/clean/riyadh_restaurants_clean.csv", index=False)
 Output:
 
 - `data/clean/riyadh_restaurants_clean.csv`
-- `19,355` cleaned rows, NA patterns as described above.
+- `19,355` cleaned rows, including engineered columns `postcode` and `price_code`.
 
 ---
 
@@ -256,6 +315,7 @@ Output:
 - `data/clean/riyadh_restaurants_clean.geojson`
 - Geometry type: **Point**
 - CRS: **EPSG:4326 (WGS 84)**
+- Includes all attributes from the CSV (`postcode`, `price_code`, etc.).
 
 ---
 
@@ -292,7 +352,7 @@ ogr2ogr -f "CSV"   data/sample_district/restaurants_sample_district.csv   data/s
 
 - Output:
   - `data/sample_district/restaurants_sample_district.csv`
-  - Same attributes as the full cleaned CSV, but subset to the study region.
+  - Same attributes as the full cleaned CSV, including `postcode` and `price_code`, but subset to the study region.
 
 ---
 
@@ -313,6 +373,8 @@ Both are in **EPSG:4326**, ready for:
 - QGIS,
 - Web maps (Leaflet, Mapbox, etc.).
 
+You can also group or filter by `postcode` for local patterns.
+
 ### 7.2 Business Analyst (Member 3)
 
 Use:
@@ -325,7 +387,9 @@ Use:
 Notes:
 
 - `price` and `rating` have **no missing values** → safe for correlations and plots.
+- `price_code` is ideal for numeric analysis (correlations, models).
 - `ratingSignals` has many `NaN` → filter or treat explicitly when used.
+- `postcode` can be used to summarize results by postal code where available.
 
 ### 7.3 Dashboard Developer (Member 4)
 
@@ -338,6 +402,7 @@ Example pages:
 
 - **All Riyadh overview** → use full cleaned dataset.
 - **Sample District deep-dive** → use `restaurants_sample_district` files.
+- Extra filters: by `price`, `price_code`, or `postcode`.
 
 ---
 
@@ -368,12 +433,4 @@ To completely reproduce the data engineering outputs:
    ```
 
 After these steps, all files used by Spatial, Business, and Dashboard roles will be regenerated from scratch.
-
----
-
-## 9. Additional Documentation
-
-For a detailed narrative (including rationale behind each decision), see:
-
-- `docs/Data_Engineering_and_Preprocessing_Report (1).pdf`
 
